@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Set, Tuple
@@ -53,6 +53,7 @@ class HostResult:
     gpus: List[GPU]
     latency_ms: int
     error: Optional[str] = None
+    aliases: List[str] = field(default_factory=list)
 
 
 def _number(value: str) -> Optional[float]:
@@ -156,6 +157,46 @@ def discover_hosts(config_path: Path, _visited: Optional[Set[Path]] = None) -> L
     return list(dict.fromkeys(hosts))
 
 
+def resolve_ssh_endpoint(host: str, ssh_config: Optional[Path]) -> Tuple[str, str]:
+    """Resolve an SSH alias to the hostname and port used for deduplication."""
+    command = ["ssh", "-G"]
+    if ssh_config is not None:
+        command.extend(["-F", str(ssh_config.expanduser())])
+    command.extend(["--", host])
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ("alias", host)
+    if completed.returncode != 0:
+        return ("alias", host)
+
+    resolved = {}
+    for line in completed.stdout.splitlines():
+        key, separator, value = line.partition(" ")
+        if separator and key.lower() in {"hostname", "port"}:
+            resolved[key.lower()] = value.strip()
+    hostname = resolved.get("hostname")
+    port = resolved.get("port")
+    if not hostname or not port:
+        return ("alias", host)
+    return (hostname.casefold(), port)
+
+
+def group_hosts_by_endpoint(hosts: Sequence[str], ssh_config: Optional[Path]) -> List[Tuple[str, List[str]]]:
+    """Group aliases resolving to one endpoint while preserving config order."""
+    groups = {}
+    for host in hosts:
+        endpoint = resolve_ssh_endpoint(host, ssh_config)
+        groups.setdefault(endpoint, []).append(host)
+    return [(aliases[0], aliases) for aliases in groups.values()]
+
+
 def query_host(host: str, timeout: float, ssh_config: Optional[Path] = None) -> HostResult:
     connect_timeout = max(1, int(timeout))
     command = [
@@ -233,10 +274,19 @@ def _color_for(value: Optional[float], yellow: float, red: float, enabled: bool)
 def render(results: Sequence[HostResult], color: bool, timestamp: datetime) -> str:
     ok = sum(result.error is None for result in results)
     gpu_count = sum(len(result.gpus) for result in results)
-    heading = f"GPU SSH Monitor  {timestamp:%Y-%m-%d %H:%M:%S}  {ok}/{len(results)} hosts  {gpu_count} GPUs"
+    alias_count = sum(len(result.aliases) if result.aliases else 1 for result in results)
+    heading = (
+        f"GPU SSH Monitor  {timestamp:%Y-%m-%d %H:%M:%S}  "
+        f"{ok}/{len(results)} servers  {alias_count} SSH aliases  {gpu_count} GPUs"
+    )
     if color:
         heading = BOLD + CYAN + heading + RESET
-    lines = [heading, ""]
+    lines = [heading]
+    for result in results:
+        if len(result.aliases) > 1:
+            note = f"↳ {', '.join(result.aliases)} → queried once via {result.host}"
+            lines.append((DIM + note + RESET) if color else note)
+    lines.append("")
     header = f"{'HOST':<18} {'GPU':>3}  {'MODEL':<24} {'UTIL':>6} {'UTILIZATION':<10} {'MEMORY':>17} {'TEMP':>6} {'POWER':>13} {'RTT':>7}"
     lines.append((BOLD + header + RESET) if color else header)
     lines.append("─" * 115)
@@ -244,10 +294,12 @@ def render(results: Sequence[HostResult], color: bool, timestamp: datetime) -> s
         if result.error:
             prefix = RED if color else ""
             suffix = RESET if color else ""
-            lines.append(f"{prefix}{result.host:<18}  !   {result.error} ({result.latency_ms}ms){suffix}")
+            host_label = result.host + (f" [+{len(result.aliases) - 1}]" if len(result.aliases) > 1 else "")
+            lines.append(f"{prefix}{host_label:<18}  !   {result.error} ({result.latency_ms}ms){suffix}")
             continue
         for position, gpu in enumerate(result.gpus):
-            host = result.host if position == 0 else ""
+            host = result.host + (f" [+{len(result.aliases) - 1}]" if len(result.aliases) > 1 else "")
+            host = host[:18] if position == 0 else ""
             util_color = _color_for(gpu.utilization_pct, 70, 90, color)
             temp_color = _color_for(gpu.temperature_c, 70, 85, color)
             mem_pct = None
@@ -275,6 +327,7 @@ def json_payload(results: Sequence[HostResult], timestamp: datetime) -> str:
         "hosts": [
             {
                 "host": result.host,
+                "aliases": result.aliases or [result.host],
                 "latency_ms": result.latency_ms,
                 "error": result.error,
                 "gpus": [asdict(gpu) for gpu in result.gpus],
@@ -300,7 +353,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-F", "--ssh-config", type=Path, default=Path("~/.ssh/config"), help="SSH 配置路径")
     parser.add_argument("--no-config", action="store_true", help="连接时不向 ssh 传递 -F 配置路径")
     parser.add_argument("--no-color", action="store_true", help="关闭彩色输出")
-    parser.add_argument("--version", action="version", version="%(prog)s 0.1.0")
+    parser.add_argument("--version", action="version", version="%(prog)s 0.1.1")
     return parser
 
 
@@ -332,6 +385,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     once = args.once or args.json or not sys.stdout.isatty()
     color = not args.no_color and sys.stdout.isatty() and not args.json
     ssh_config = None if args.no_config else config_path
+    host_groups = group_hosts_by_endpoint(hosts, ssh_config)
+    query_hosts = [representative for representative, _aliases in host_groups]
+    aliases_by_host = {representative: aliases for representative, aliases in host_groups}
     stop = False
 
     def request_stop(_signum: int, _frame: object) -> None:
@@ -342,7 +398,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     first = True
     try:
         while not stop:
-            results = collect(hosts, args.timeout, args.parallel, ssh_config)
+            results = collect(query_hosts, args.timeout, args.parallel, ssh_config)
+            for result in results:
+                result.aliases = aliases_by_host[result.host]
             now = datetime.now().astimezone()
             output = json_payload(results, now) if args.json else render(results, color, now)
             if not first and not once:
