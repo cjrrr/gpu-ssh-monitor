@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gpu-ssh-monitor"
+version = "0.1.0"
+description = "Monitor NVIDIA GPUs across SSH hosts in one terminal."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [{name = "gpu-ssh-monitor contributors"}]
+
+[project.scripts]
+gsm = "gpu_ssh_monitor.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
